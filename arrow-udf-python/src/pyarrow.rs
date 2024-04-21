@@ -17,7 +17,7 @@
 use arrow_array::{array::*, builder::*};
 use arrow_buffer::OffsetBuffer;
 use arrow_schema::DataType;
-use pyo3::{types::PyString, IntoPy, PyObject, PyResult, Python};
+use pyo3::{IntoPy, PyObject, PyResult, Python};
 use std::sync::Arc;
 
 macro_rules! get_pyobject {
@@ -46,23 +46,26 @@ pub fn get_pyobject(py: Python<'_>, array: &dyn Array, i: usize) -> PyResult<PyO
         DataType::Float32 => get_pyobject!(Float32Array, py, array, i),
         DataType::Float64 => get_pyobject!(Float64Array, py, array, i),
         DataType::Utf8 => get_pyobject!(StringArray, py, array, i),
+        DataType::LargeUtf8 => get_pyobject!(LargeStringArray, py, array, i),
         DataType::Binary => get_pyobject!(BinaryArray, py, array, i),
+        DataType::LargeBinary => get_pyobject!(LargeBinaryArray, py, array, i),
+
         // json type
-        DataType::LargeUtf8 => {
-            let array = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
-            let json_str = PyString::new(py, array.value(i));
-            // XXX: it is slow to call eval every time
-            let json_loads = py.eval("json.loads", None, None)?;
-            json_loads.call1((json_str,))?.into()
-        }
-        // decimal type
-        DataType::LargeBinary => {
-            let array = array.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
-            let string = std::str::from_utf8(array.value(i))?;
-            // XXX: it is slow to call eval every time
-            let decimal_constructor = py.import("decimal")?.getattr("Decimal")?;
-            decimal_constructor.call1((string,))?.into()
-        }
+        // DataType::LargeUtf8 => {
+        //     let array = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
+        //     let json_str = PyString::new(py, array.value(i));
+        //     // XXX: it is slow to call eval every time
+        //     let json_loads = py.eval("json.loads", None, None)?;
+        //     json_loads.call1((json_str,))?.into()
+        // }
+        // // decimal type
+        // DataType::LargeBinary => {
+        //     let array = array.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+        //     let string = std::str::from_utf8(array.value(i))?;
+        //     // XXX: it is slow to call eval every time
+        //     let decimal_constructor = py.import("decimal")?.getattr("Decimal")?;
+        //     decimal_constructor.call1((string,))?.into()
+        // }
         // list
         DataType::List(_) => {
             let array = array.as_any().downcast_ref::<ListArray>().unwrap();

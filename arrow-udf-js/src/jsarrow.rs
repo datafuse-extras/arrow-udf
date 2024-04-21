@@ -59,18 +59,20 @@ pub fn get_jsvalue<'a>(
         DataType::Float32 => get_jsvalue!(Float32Array, ctx, array, i),
         DataType::Float64 => get_jsvalue!(Float64Array, ctx, array, i),
         DataType::Utf8 => get_jsvalue!(StringArray, ctx, array, i),
+        DataType::LargeUtf8 => get_jsvalue!(LargeStringArray, ctx, array, i),
         DataType::Binary => get_jsvalue!(BinaryArray, ctx, array, i),
-        // json type
-        DataType::LargeUtf8 => {
-            let array = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
-            ctx.json_parse(array.value(i))
-        }
-        // decimal type
-        DataType::LargeBinary => {
-            let array = array.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
-            let string = std::str::from_utf8(array.value(i))?;
-            bigdecimal.call((string,))
-        }
+        DataType::LargeBinary => get_jsvalue!(LargeBinaryArray, ctx, array, i),
+        // // json type
+        // DataType::LargeUtf8 => {
+        //     let array = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
+        //     ctx.json_parse(array.value(i))
+        // }
+        // // decimal type
+        // DataType::LargeBinary => {
+        //     let array = array.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+        //     let string = std::str::from_utf8(array.value(i))?;
+        //     bigdecimal.call((string,))
+        // }
         // list
         DataType::List(inner) => {
             let array = array.as_any().downcast_ref::<ListArray>().unwrap();
