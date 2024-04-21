@@ -312,6 +312,7 @@ impl FunctionAttr {
                 }
                 let mut index_builder = Int32Builder::with_capacity(input.num_rows());
                 let mut builder = #builder;
+                let builder = &mut builder;
                 #let_error_builder
                 for i in 0..input.num_rows() {
                     #(let #inputs = unsafe { (!#arrays.is_null(i)).then(|| #arrays.value_unchecked(i)) };)*
@@ -591,7 +592,7 @@ pub fn gen_append_value(ty: &str) -> TokenStream2 {
     } else if ty == "time" {
         quote! { builder.append_value(arrow_array::temporal_conversions::time_to_time64us(v)) }
     } else if ty == "timestamp" {
-        quote! { builder.append_value(v.timestamp_micros()) }
+        quote! { builder.append_value(v.and_utc().timestamp_micros()) }
     } else if ty == "interval" {
         quote! { builder.append_value({
             let v: arrow_udf::types::Interval = v.into();

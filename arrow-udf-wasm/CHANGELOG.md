@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2024-04-07
+
+### Changed
+
+- Update `wasmtime` to v19.
+- Update `arrow` version to >=50.
+- Stdio is no longer inherited. Stdout and stderr will be included in the error message.
+
 ## [0.2.0] - 2024-02-29
 
 ### Added
