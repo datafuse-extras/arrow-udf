@@ -148,32 +148,34 @@ pub fn build_array(
         DataType::Float64 => build_array!(Float64Builder, py, values),
         DataType::Utf8 => build_array!(StringBuilder, &str, py, values),
         DataType::Binary => build_array!(BinaryBuilder, &[u8], py, values),
+        DataType::LargeUtf8 => build_array!(LargeStringBuilder, &str, py, values),
+        DataType::LargeBinary => build_array!(LargeBinaryBuilder, &[u8], py, values),
         // json type
-        DataType::LargeUtf8 => {
-            let json_dumps = py.eval("json.dumps", None, None)?;
-            let mut builder = LargeStringBuilder::with_capacity(values.len(), 1024);
-            for val in values {
-                if val.is_none(py) {
-                    builder.append_null();
-                    continue;
-                };
-                let json_str = json_dumps.call1((val,))?;
-                builder.append_value(json_str.extract::<&str>()?);
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        // decimal type
-        DataType::LargeBinary => {
-            let mut builder = LargeBinaryBuilder::with_capacity(values.len(), 1024);
-            for val in values {
-                if val.is_none(py) {
-                    builder.append_null();
-                } else {
-                    builder.append_value(val.to_string());
-                }
-            }
-            Ok(Arc::new(builder.finish()))
-        }
+        // DataType::LargeUtf8 => {
+        //     let json_dumps = py.eval("json.dumps", None, None)?;
+        //     let mut builder = LargeStringBuilder::with_capacity(values.len(), 1024);
+        //     for val in values {
+        //         if val.is_none(py) {
+        //             builder.append_null();
+        //             continue;
+        //         };
+        //         let json_str = json_dumps.call1((val,))?;
+        //         builder.append_value(json_str.extract::<&str>()?);
+        //     }
+        //     Ok(Arc::new(builder.finish()))
+        // }
+        // // decimal type
+        // DataType::LargeBinary => {
+        //     let mut builder = LargeBinaryBuilder::with_capacity(values.len(), 1024);
+        //     for val in values {
+        //         if val.is_none(py) {
+        //             builder.append_null();
+        //         } else {
+        //             builder.append_value(val.to_string());
+        //         }
+        //     }
+        //     Ok(Arc::new(builder.finish()))
+        // }
         // list
         DataType::List(inner) => {
             // flatten lists

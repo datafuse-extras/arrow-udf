@@ -169,40 +169,42 @@ pub fn build_array<'a>(
         DataType::Float64 => build_array!(Float64Builder, ctx, values),
         DataType::Utf8 => build_array!(StringBuilder, String, ctx, values),
         DataType::Binary => build_array!(BinaryBuilder, Vec::<u8>, ctx, values),
+        DataType::LargeUtf8 => build_array!(LargeStringBuilder, String, ctx, values),
+        DataType::LargeBinary => build_array!(LargeBinaryBuilder, Vec::<u8>, ctx, values),
         // json type
-        DataType::LargeUtf8 => {
-            let mut builder = LargeStringBuilder::with_capacity(values.len(), 1024);
-            for val in values {
-                if val.is_null() || val.is_undefined() {
-                    builder.append_null();
-                } else if let Some(s) = ctx.json_stringify(val)? {
-                    builder.append_value(s.to_string()?);
-                } else {
-                    builder.append_null();
-                }
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        // decimal type
-        DataType::LargeBinary => {
-            let mut builder = LargeBinaryBuilder::with_capacity(values.len(), 1024);
-            let bigdecimal_to_string: Function = ctx
-                .eval("BigDecimal.prototype.toString")
-                .context("failed to get BigDecimal.prototype.string")?;
-            for val in values {
-                if val.is_null() || val.is_undefined() {
-                    builder.append_null();
-                } else {
-                    let mut args = Args::new(ctx.clone(), 0);
-                    args.this(val)?;
-                    let string: String = bigdecimal_to_string.call_arg(args).context(
-                        "failed to convert BigDecimal to string. make sure you return a BigDecimal value",
-                    )?;
-                    builder.append_value(string);
-                }
-            }
-            Ok(Arc::new(builder.finish()))
-        }
+        // DataType::LargeUtf8 => {
+        //     let mut builder = LargeStringBuilder::with_capacity(values.len(), 1024);
+        //     for val in values {
+        //         if val.is_null() || val.is_undefined() {
+        //             builder.append_null();
+        //         } else if let Some(s) = ctx.json_stringify(val)? {
+        //             builder.append_value(s.to_string()?);
+        //         } else {
+        //             builder.append_null();
+        //         }
+        //     }
+        //     Ok(Arc::new(builder.finish()))
+        // }
+        // // decimal type
+        // DataType::LargeBinary => {
+        //     let mut builder = LargeBinaryBuilder::with_capacity(values.len(), 1024);
+        //     let bigdecimal_to_string: Function = ctx
+        //         .eval("BigDecimal.prototype.toString")
+        //         .context("failed to get BigDecimal.prototype.string")?;
+        //     for val in values {
+        //         if val.is_null() || val.is_undefined() {
+        //             builder.append_null();
+        //         } else {
+        //             let mut args = Args::new(ctx.clone(), 0);
+        //             args.this(val)?;
+        //             let string: String = bigdecimal_to_string.call_arg(args).context(
+        //                 "failed to convert BigDecimal to string. make sure you return a BigDecimal value",
+        //             )?;
+        //             builder.append_value(string);
+        //         }
+        //     }
+        //     Ok(Arc::new(builder.finish()))
+        // }
         // list
         DataType::List(inner) => {
             // flatten lists
