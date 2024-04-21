@@ -18,7 +18,7 @@ use anyhow::{Context, Result};
 use arrow_array::{array::*, builder::*};
 use arrow_buffer::OffsetBuffer;
 use arrow_schema::DataType;
-use rquickjs::{function::Args, Ctx, Error, FromJs, Function, IntoJs, Object, TypedArray, Value};
+use rquickjs::{Ctx, Error, FromJs, Function, IntoJs, Object, TypedArray, Value};
 use std::sync::Arc;
 
 macro_rules! get_jsvalue {
