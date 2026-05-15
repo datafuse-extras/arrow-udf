@@ -568,18 +568,17 @@ impl Runtime {
             CallMode::ReturnNullOnNullInput => {
                 // This is a bit tricky. We build input arrays without nulls, call user_fn on them,
                 // and then add back null results to form the final result.
-                let n_cols = input.num_columns();
                 let n_rows = input.num_rows();
 
                 // 1. Build a bitmap of which rows have nulls
                 let mut bitmap = Vec::with_capacity(n_rows);
-                for i in 0..n_rows {
-                    let has_null = (0..n_cols).any(|j| js_columns[j][i].is_null());
+                for row_idx in 0..n_rows {
+                    let has_null = js_columns.iter().any(|column| column[row_idx].is_null());
                     bitmap.push(!has_null);
                 }
 
                 // 2. Build new inputs with only the rows that don't have nulls
-                let mut filtered_columns = Vec::with_capacity(n_cols);
+                let mut filtered_columns = Vec::with_capacity(js_columns.len());
                 for js_values in js_columns {
                     let filtered_js_values: Vec<_> = js_values
                         .into_iter()

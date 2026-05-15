@@ -42,7 +42,7 @@ impl Interpreter {
             // XXX: import the `decimal` module in the interpreter before calling anything else
             //      otherwise it will cause `SIGABRT: pointer being freed was not allocated`
             //      when importing decimal in the second sub-interpreter.
-            Python::with_gil(|py| {
+            Python::attach(|py| {
                 py.import("decimal").unwrap();
             });
         });
@@ -59,7 +59,7 @@ impl Interpreter {
     where
         F: for<'py> FnOnce(Python<'py>) -> Result<R, PyError>,
     {
-        Python::with_gil(f)
+        Python::attach(f)
     }
 
     /// Run Python code in the sub-interpreter.

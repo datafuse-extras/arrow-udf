@@ -22,9 +22,11 @@ use pyo3::{
     ffi::c_str,
     prelude::PyDictMethods,
     types::{PyAnyMethods, PyDict},
-    IntoPyObject, PyObject, PyResult, Python,
+    IntoPyObject, Py, PyAny, PyResult, Python,
 };
 use std::{borrow::Cow, ffi::CString, sync::Arc};
+
+type PyObject = Py<PyAny>;
 
 macro_rules! get_pyobject {
     ($array_type: ty, $py:expr, $array:expr, $i:expr) => {{
@@ -403,7 +405,7 @@ impl Converter {
                 for val in values {
                     if !val.is_none(py) {
                         let py_any = val.bind(py);
-                        let dict = py_any.downcast::<PyDict>()?;
+                        let dict = py_any.cast::<PyDict>()?;
                         flatten_keys.reserve(dict.len());
                         flatten_values.reserve(dict.len());
                         for key in dict.keys() {

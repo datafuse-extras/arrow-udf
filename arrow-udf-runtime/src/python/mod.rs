@@ -23,11 +23,13 @@ use arrow_array::builder::{ArrayBuilder, Int32Builder, StringBuilder};
 use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch};
 use arrow_schema::{DataType, Field, FieldRef, Schema, SchemaRef};
 use pyo3::types::{PyAnyMethods, PyIterator, PyModule, PyTuple};
-use pyo3::{Py, PyObject};
+use pyo3::{Py, PyAny};
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fmt::Debug;
 use std::sync::Arc;
+
+type PyObject = Py<PyAny>;
 
 // #[cfg(Py_3_12)]
 mod interpreter;
@@ -99,9 +101,17 @@ struct Aggregate {
 
 /// A builder for `Runtime`.
 #[derive(Default, Debug)]
-pub struct Builder {}
+pub struct Builder {
+    safe_codes: Option<String>,
+}
 
 impl Builder {
+    /// Run initialization code before user-defined functions are registered.
+    pub fn safe_codes(mut self, code: String) -> Self {
+        self.safe_codes = Some(code);
+        self
+    }
+
     /// Build the `Runtime`.
     pub fn build(self) -> Result<Runtime> {
         let interpreter = Interpreter::new()?;
@@ -117,6 +127,9 @@ class Struct:
     pass
 "#,
         )?;
+        if let Some(code) = self.safe_codes {
+            interpreter.run(&code)?;
+        }
         Ok(Runtime {
             interpreter,
             functions: HashMap::new(),
