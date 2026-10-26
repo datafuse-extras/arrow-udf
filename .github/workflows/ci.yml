@@ -152,8 +152,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions-rs/toolchain@v1
         with:
-          # all crates are built using the nightly toolchain on docs.rs
-          toolchain: nightly
+          # all crates are built using the nightly toolchain on docs.rs.
+          # Pinned: newer nightlies (verified 2026-08-27) reject rquickjs-core
+          # 0.6.2 (never-type fallback, reported as a future-incompat warning
+          # on stable); unpin after upgrading rquickjs.
+          toolchain: nightly-2025-12-11
           override: true
       - uses: actions/setup-python@v5
         with:
