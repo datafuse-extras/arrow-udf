@@ -5,6 +5,7 @@ members = [
   "arrow-udf/arrow-udf-macros",
   "arrow-udf-bench",
   "arrow-udf-example",
+  "arrow-udf-python-worker",
   "arrow-udf-runtime",
 ]
 exclude = ["arrow-udf-duckdb-example"]

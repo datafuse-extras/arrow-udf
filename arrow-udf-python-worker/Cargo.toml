@@ -1,0 +1,32 @@
+[package]
+name = "arrow-udf-python-worker"
+version = "0.1.0"
+description = "Out-of-process, sandboxed execution of Python Arrow UDFs."
+keywords = ["arrow", "udf", "python", "sandbox"]
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-ipc = { workspace = true }
+arrow-schema = { workspace = true, features = ["serde"] }
+arrow-select = { workspace = true }
+arrow-udf-runtime = { path = "../arrow-udf-runtime", version = "0.8", default-features = false, features = ["python-runtime"] }
+libc = "0.2"
+log = "0.4"
+pyo3 = { version = "0.28", features = ["auto-initialize"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { workspace = true }
+tempfile = "3"
+tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt", "time"] }
+
+[dev-dependencies]
+arrow-select = { workspace = true }
+tempfile = "3"
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+[[test]]
+name = "worker"
+harness = false

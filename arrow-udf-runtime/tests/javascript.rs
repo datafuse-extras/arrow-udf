@@ -1629,3 +1629,137 @@ fn decimal_field(name: &str) -> Field {
     Field::new(name, DataType::Utf8, true)
         .with_metadata([("ARROW:extension:name".into(), "arrowudf.decimal".into())].into())
 }
+
+fn int32_input(values: Vec<i32>) -> RecordBatch {
+    let schema = Schema::new(vec![Field::new("x", DataType::Int32, true)]);
+    RecordBatch::try_new(Arc::new(schema), vec![Arc::new(Int32Array::from(values))]).unwrap()
+}
+
+/// The deadline spans the whole operation: converting the result to Arrow
+/// reads properties, which runs user getters after the function returned.
+#[tokio::test]
+async fn test_timeout_covers_result_conversion() {
+    let mut runtime = Runtime::new().await.unwrap();
+    runtime.set_timeout(Some(Duration::from_millis(100))).await;
+    runtime
+        .add_function(
+            "getter",
+            DataType::Struct(vec![Field::new("a", DataType::Int32, true)].into()),
+            "export function getter(x) { return { get a() { while (true) {} } }; }",
+            FunctionOptions::default().return_null_on_null_input(),
+        )
+        .await
+        .unwrap();
+    // Conversion errors do not carry QuickJS' "interrupted" message; returning
+    // at all proves the interrupt, since the getter never terminates.
+    let start = std::time::Instant::now();
+    assert!(runtime.call("getter", &int32_input(vec![1])).await.is_err());
+    assert!(start.elapsed() >= Duration::from_millis(100));
+}
+
+/// Continuations of an async function run after the call returned a promise.
+#[tokio::test]
+async fn test_timeout_covers_async_continuation() {
+    let mut runtime = Runtime::new().await.unwrap();
+    runtime.set_timeout(Some(Duration::from_millis(100))).await;
+    runtime
+        .add_function(
+            "spin",
+            DataType::Int32,
+            "export async function spin(x) { await null; while (true) {} }",
+            FunctionOptions::default()
+                .return_null_on_null_input()
+                .async_mode(),
+        )
+        .await
+        .unwrap();
+    let err = runtime
+        .call("spin", &int32_input(vec![1]))
+        .await
+        .unwrap_err();
+    assert!(format!("{err:?}").contains("interrupted"), "{err:?}");
+}
+
+/// Aggregate operations, including the state conversion, are bounded.
+#[tokio::test]
+async fn test_timeout_covers_aggregate_state_conversion() {
+    let mut runtime = Runtime::new().await.unwrap();
+    runtime.set_timeout(Some(Duration::from_millis(100))).await;
+    runtime
+        .add_aggregate(
+            "agg",
+            DataType::Struct(vec![Field::new("a", DataType::Int32, true)].into()),
+            DataType::Int32,
+            r#"
+            export function create_state() { return { get a() { while (true) {} } }; }
+            export function accumulate(state, x) { return state; }
+            export function finish(state) { return 0; }
+            "#,
+            AggregateOptions::default().return_null_on_null_input(),
+        )
+        .await
+        .unwrap();
+    let start = std::time::Instant::now();
+    assert!(runtime.create_state("agg").await.is_err());
+    assert!(start.elapsed() >= Duration::from_millis(100));
+}
+
+/// Top-level module code is bounded while the function is added. QuickJS
+/// reports the interrupted module evaluation through a promise that is not
+/// awaited, so the observable effect is that `add_function` returns.
+#[tokio::test]
+async fn test_timeout_covers_module_evaluation() {
+    let mut runtime = Runtime::new().await.unwrap();
+    runtime.set_timeout(Some(Duration::from_millis(100))).await;
+    let start = std::time::Instant::now();
+    let _ = runtime
+        .add_function(
+            "f",
+            DataType::Int32,
+            "while (true) {}\nexport function f(x) { return x; }",
+            FunctionOptions::default().return_null_on_null_input(),
+        )
+        .await;
+    assert!(start.elapsed() >= Duration::from_millis(100));
+}
+
+/// Each operation gets a fresh deadline, and no deadline is armed between
+/// operations.
+#[tokio::test]
+async fn test_timeout_is_per_operation() {
+    let mut runtime = Runtime::new().await.unwrap();
+    runtime.set_timeout(Some(Duration::from_millis(100))).await;
+    runtime
+        .add_function(
+            "f",
+            DataType::Int32,
+            "export function f(x) { if (x < 0) { while (true) {} } return x; }",
+            FunctionOptions::default().return_null_on_null_input(),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    runtime.call("f", &int32_input(vec![1])).await.unwrap();
+    assert!(runtime.call("f", &int32_input(vec![-1])).await.is_err());
+    runtime.call("f", &int32_input(vec![2])).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_memory_limit_none_is_unlimited() {
+    let mut runtime = Runtime::new().await.unwrap();
+    runtime.set_memory_limit(Some(1 << 20)).await;
+    runtime.set_memory_limit(None).await;
+    runtime
+        .add_function(
+            "alloc",
+            DataType::Int32,
+            "export function alloc(x) { new Array(x).fill(0); return x; }",
+            FunctionOptions::default().return_null_on_null_input(),
+        )
+        .await
+        .unwrap();
+    runtime
+        .call("alloc", &int32_input(vec![4 << 20]))
+        .await
+        .unwrap();
+}

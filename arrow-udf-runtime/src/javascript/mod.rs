@@ -227,10 +227,32 @@ impl Runtime {
     /// # });
     /// ```
     pub async fn set_memory_limit(&self, limit: Option<usize>) {
-        self.runtime.set_memory_limit(limit.unwrap_or(0)).await;
+        // QuickJS treats a limit of 0 as "no memory at all", not "unlimited".
+        self.runtime
+            .set_memory_limit(limit.unwrap_or(usize::MAX))
+            .await;
     }
 
-    /// Set the timeout of each function call.
+    /// Set the timeout of each operation.
+    ///
+    /// The deadline covers a whole operation, not only the user function call:
+    /// argument conversion, user code (including continuations of async
+    /// functions), and conversion of the results to Arrow, which can run user
+    /// code such as getters and `toJSON`. Operations are [`call`], each
+    /// [`RecordBatchIter::next`] of a table function, [`create_state`],
+    /// [`accumulate`], [`accumulate_or_retract`], [`merge`] and [`finish`].
+    /// Top-level module code evaluated by [`add_function`] and
+    /// [`add_aggregate`] is bounded too, so set the timeout before adding
+    /// functions.
+    ///
+    /// [`call`]: Runtime::call
+    /// [`create_state`]: Runtime::create_state
+    /// [`accumulate`]: Runtime::accumulate
+    /// [`accumulate_or_retract`]: Runtime::accumulate_or_retract
+    /// [`merge`]: Runtime::merge
+    /// [`finish`]: Runtime::finish
+    /// [`add_function`]: Runtime::add_function
+    /// [`add_aggregate`]: Runtime::add_aggregate
     ///
     /// # Example
     ///
@@ -256,6 +278,22 @@ impl Runtime {
                 .await;
         } else {
             self.runtime.set_interrupt_handler(None).await;
+        }
+    }
+
+    /// Arm the deadline for one operation; it is cleared when the guard drops,
+    /// including when the operation's future is cancelled. Arm it while the
+    /// runtime lock is held (inside `async_with!`), so operations on one
+    /// runtime never overlap.
+    fn arm_deadline(&self) -> DeadlineGuard<'_> {
+        match self.timeout {
+            Some(timeout) => {
+                // A deadline beyond the clock range cannot fire.
+                self.deadline
+                    .store(Instant::now().checked_add(timeout), Ordering::Relaxed);
+                DeadlineGuard(Some(&self.deadline))
+            }
+            None => DeadlineGuard(None),
         }
     }
 
@@ -332,6 +370,7 @@ impl Runtime {
         code: &str,
         options: FunctionOptions,
     ) -> Result<()> {
+        let deadline = self.arm_deadline();
         let function = async_with!(self.context => |ctx| {
             let (module, _) = Module::declare(ctx.clone(), name, code)
                 .map_err(|e| check_exception(e, &ctx))
@@ -346,8 +385,9 @@ impl Runtime {
                 options,
             }) as Result<Function>
         })
-        .await?;
-        self.functions.insert(name.to_string(), function);
+        .await;
+        drop(deadline);
+        self.functions.insert(name.to_string(), function?);
         Ok(())
     }
 
@@ -428,6 +468,7 @@ impl Runtime {
         code: &str,
         options: AggregateOptions,
     ) -> Result<()> {
+        let deadline = self.arm_deadline();
         let aggregate = async_with!(self.context => |ctx| {
             let (module, _) = Module::declare(ctx.clone(), name, code)
                 .map_err(|e| check_exception(e, &ctx))
@@ -446,7 +487,9 @@ impl Runtime {
                 options,
             }) as Result<Aggregate>
         })
-        .await?;
+        .await;
+        drop(deadline);
+        let aggregate = aggregate?;
 
         if aggregate.finish.is_none() && aggregate.state_field != aggregate.output_field {
             bail!("`output_type` must be the same as `state_type` when `finish` is not defined");
@@ -481,6 +524,7 @@ impl Runtime {
         let function = self.functions.get(name).context("function not found")?;
 
         async_with!(self.context => |ctx| {
+            let _deadline = self.arm_deadline();
             if function.options.is_batched {
                 self.call_batched_function(&ctx, function, input).await
             } else {
@@ -691,6 +735,7 @@ impl Runtime {
     pub async fn create_state(&self, name: &str) -> Result<ArrayRef> {
         let aggregate = self.aggregates.get(name).context("function not found")?;
         let state = async_with!(self.context => |ctx| {
+            let _deadline = self.arm_deadline();
             let create_state = aggregate.create_state.clone().restore(&ctx)?;
             let state = self
                 .call_user_fn(&ctx, &create_state, Args::new(ctx.clone(), 0), aggregate.options.is_async)
@@ -730,6 +775,7 @@ impl Runtime {
         let aggregate = self.aggregates.get(name).context("function not found")?;
         // convert each row to python objects and call the accumulate function
         let new_state = async_with!(self.context => |ctx| {
+            let _deadline = self.arm_deadline();
             let accumulate = aggregate.accumulate.clone().restore(&ctx)?;
             let mut state = self
                 .converter
@@ -794,6 +840,7 @@ impl Runtime {
         let aggregate = self.aggregates.get(name).context("function not found")?;
         // convert each row to python objects and call the accumulate function
         let new_state = async_with!(self.context => |ctx| {
+        let _deadline = self.arm_deadline();
         let accumulate = aggregate.accumulate.clone().restore(&ctx)?;
         let retract = aggregate
             .retract
@@ -854,6 +901,7 @@ impl Runtime {
     pub async fn merge(&self, name: &str, states: &dyn Array) -> Result<ArrayRef> {
         let aggregate = self.aggregates.get(name).context("function not found")?;
         let output = async_with!(self.context => |ctx| {
+            let _deadline = self.arm_deadline();
             let merge = aggregate
                 .merge
                 .clone()
@@ -905,6 +953,7 @@ impl Runtime {
             return Ok(states.clone());
         };
         let output = async_with!(self.context => |ctx| {
+            let _deadline = self.arm_deadline();
             let finish = aggregate.finish.clone().unwrap().restore(&ctx)?;
             let mut results = Vec::with_capacity(states.len());
             for i in 0..states.len() {
@@ -933,8 +982,6 @@ impl Runtime {
     }
 
     /// Call a user function.
-    ///
-    /// If `timeout` is set, the function will be interrupted after the timeout.
     async fn call_user_fn<'js, T: FromJs<'js>>(
         &self,
         ctx: &Ctx<'js>,
@@ -955,16 +1002,11 @@ impl Runtime {
         f: &rquickjs::Function<'js>,
         args: Args<'js>,
     ) -> Result<T> {
-        let call_result = if let Some(timeout) = self.timeout {
-            self.deadline
-                .store(Some(Instant::now() + timeout), Ordering::Relaxed);
-            let call_result = f.call_arg::<Promise>(args);
-            self.deadline.store(None, Ordering::Relaxed);
-            call_result
-        } else {
-            f.call_arg::<Promise>(args)
-        };
-        let promise = call_result.map_err(|e| check_exception(e, ctx))?;
+        // Bounded by the deadline of the enclosing operation, also while the
+        // promise's continuations run.
+        let promise = f
+            .call_arg::<Promise>(args)
+            .map_err(|e| check_exception(e, ctx))?;
         promise
             .into_future::<T>()
             .await
@@ -977,16 +1019,8 @@ impl Runtime {
         f: &rquickjs::Function<'js>,
         args: Args<'js>,
     ) -> Result<T> {
-        let result = if let Some(timeout) = self.timeout {
-            self.deadline
-                .store(Some(Instant::now() + timeout), Ordering::Relaxed);
-            let result = f.call_arg(args);
-            self.deadline.store(None, Ordering::Relaxed);
-            result
-        } else {
-            f.call_arg(args)
-        };
-        result.map_err(|e| check_exception(e, ctx))
+        // Bounded by the deadline of the enclosing operation.
+        f.call_arg(args).map_err(|e| check_exception(e, ctx))
     }
 
     pub fn context(&self) -> &AsyncContext {
@@ -999,6 +1033,17 @@ impl Runtime {
     #[cfg(feature = "javascript-fetch")]
     pub async fn enable_fetch(&self) -> Result<()> {
         fetch::enable_fetch(&self.runtime, &self.context).await
+    }
+}
+
+/// Clears the operation deadline on drop.
+struct DeadlineGuard<'a>(Option<&'a atomic_time::AtomicOptionInstant>);
+
+impl Drop for DeadlineGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(deadline) = self.0 {
+            deadline.store(None, Ordering::Relaxed);
+        }
     }
 }
 
@@ -1032,6 +1077,7 @@ impl RecordBatchIter<'_> {
             return Ok(None);
         }
         async_with!(self.rt.context => |ctx| {
+            let _deadline = self.rt.arm_deadline();
             let js_function = self.function.function.clone().restore(&ctx)?;
             let mut indexes = Int32Builder::with_capacity(self.chunk_size);
             let mut results = Vec::with_capacity(self.input.num_rows());
