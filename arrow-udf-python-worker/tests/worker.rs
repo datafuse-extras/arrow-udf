@@ -343,12 +343,19 @@ async fn network_policy_tests() {
         "network",
         &format!(
             r#"
-import socket, ssl, urllib.request
+import pathlib, socket, ssl, urllib.request
 
 def handler(x):
-    ssl.create_default_context()
+    context = ssl.create_default_context()
     with urllib.request.urlopen('http://localhost:{port}/snapshot', timeout=2) as response:
         assert response.read() == b'ok'
+    # OpenSSL capath symlinks may resolve outside /etc/ssl/certs. Verify the
+    # public source CA stores remain readable on distributions that use them.
+    for directory in ['/usr/share/ca-certificates', '/usr/local/share/ca-certificates']:
+        for certificate in pathlib.Path(directory).rglob('*.crt'):
+            context.load_verify_locations(cafile=str(certificate))
+            assert context.cert_store_stats()['x509_ca'] > 0
+            break
     try:
         socket.socket(socket.AF_UNIX)
     except PermissionError:

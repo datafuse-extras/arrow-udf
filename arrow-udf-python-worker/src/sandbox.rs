@@ -81,7 +81,12 @@ const NETWORK_READ_PATHS: &[&str] = &[
     "/etc/hosts",
     "/etc/nsswitch.conf",
     "/etc/gai.conf",
+    "/etc/ssl/cert.pem",
     "/etc/ssl/certs",
+    // Hashed capath entries commonly symlink into these public CA stores.
+    "/usr/share/ca-certificates",
+    "/usr/local/share/ca-certificates",
+    "/etc/pki/tls/cert.pem",
     "/etc/pki/tls/certs",
     "/etc/pki/ca-trust/extracted",
 ];
@@ -160,10 +165,11 @@ fn enter_impl(
     read_only.extend(SYSTEM_READ_PATHS.iter().map(PathBuf::from));
     if allow_network {
         read_only.extend(NETWORK_READ_PATHS.iter().map(PathBuf::from));
-        for key in ["SSL_CERT_FILE", "SSL_CERT_DIR"] {
-            if let Some(path) = std::env::var_os(key) {
-                read_only.push(PathBuf::from(path));
-            }
+        if let Some(path) = std::env::var_os("SSL_CERT_FILE") {
+            read_only.push(PathBuf::from(path));
+        }
+        if let Some(paths) = std::env::var_os("SSL_CERT_DIR") {
+            read_only.extend(std::env::split_paths(&paths));
         }
     }
     // Resolves to /proc/<pid>: other processes' entries stay unreadable.
