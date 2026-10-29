@@ -26,7 +26,7 @@ use arrow_udf_runtime::CallMode;
 
 use crate::protocol::{
     array_batch, check_length, decode_aggregate_request, decode_batch, encode_batch, AggregateOp,
-    WorkerFunction,
+    WorkerFunction, WorkerInit,
 };
 use crate::sandbox;
 
@@ -49,7 +49,8 @@ pub struct WorkerHooks {
 pub fn run_worker(socket_path: &Path, hooks: WorkerHooks) -> Result<()> {
     let mut socket = UnixStream::connect(socket_path).context("connect to host")?;
     let init = (|| {
-        let function: WorkerFunction = serde_json::from_slice(&read_frame(&mut socket)?)?;
+        let init: WorkerInit<WorkerFunction> = serde_json::from_slice(&read_frame(&mut socket)?)?;
+        let function = init.function;
         let mut builder = arrow_udf_runtime::python::Builder::default();
         if let Some(prelude) = &function.prelude {
             builder = builder.safe_codes(prelude.clone());
@@ -61,7 +62,7 @@ pub fn run_worker(socket_path: &Path, hooks: WorkerHooks) -> Result<()> {
         if let Some(before_sandbox) = hooks.before_sandbox {
             before_sandbox()?;
         }
-        sandbox::enter().map_err(anyhow::Error::msg)?;
+        sandbox::enter(init.allow_network).map_err(anyhow::Error::msg)?;
         watch_parent(&socket)?;
         let aggregate = function.aggregate_state.is_some();
         match function.aggregate_state {

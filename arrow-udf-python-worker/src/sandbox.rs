@@ -18,7 +18,8 @@
 //! - Landlock: files are readable only below the Python installation, system
 //!   libraries and a few device/proc entries, and writable only below the
 //!   worker's private directory (its cwd and `TMPDIR`).
-//! - seccomp: no sockets (no network, no Unix sockets), no `execve`, no new
+//! - seccomp: no sockets by default (host policy may allow outbound IPv4/IPv6),
+//!   no Unix sockets, no `execve`, no new
 //!   processes, no signals to processes outside the worker, no
 //!   ptrace/io_uring/bpf/mount/namespace or kernel-module syscalls, no
 //!   path-based permission changes.
@@ -41,13 +42,13 @@ pub const SANDBOX_ENFORCED: bool = !cfg!(target_os = "macos");
 /// Confine the calling worker before it runs user code. Must run while the
 /// process is single-threaded.
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn enter() -> Result<(), String> {
-    enter_python_sandbox(&python_read_paths()?)
+pub(crate) fn enter(allow_network: bool) -> Result<(), String> {
+    enter_python_sandbox(&python_read_paths()?, allow_network)
 }
 
 /// Local development only: no Landlock/seccomp on macOS.
 #[cfg(target_os = "macos")]
-pub(crate) fn enter() -> Result<(), String> {
+pub(crate) fn enter(_allow_network: bool) -> Result<(), String> {
     Ok(())
 }
 
@@ -70,6 +71,19 @@ const SYSTEM_READ_PATHS: &[&str] = &[
     "/dev/urandom",
     "/proc/cpuinfo",
     "/sys/devices/system/cpu",
+];
+
+/// Resolver and public certificate data needed by network clients. These paths
+/// are readable only when the host explicitly authorizes network access.
+#[cfg(target_os = "linux")]
+const NETWORK_READ_PATHS: &[&str] = &[
+    "/etc/resolv.conf",
+    "/etc/hosts",
+    "/etc/nsswitch.conf",
+    "/etc/gai.conf",
+    "/etc/ssl/certs",
+    "/etc/pki/tls/certs",
+    "/etc/pki/ca-trust/extracted",
 ];
 
 /// Paths Python needs to import modules: the stdlib, `lib-dynload` and
@@ -111,7 +125,7 @@ paths = sorted(paths)
 /// Confine the calling process. Must run while it is single-threaded: a
 /// Landlock domain only covers the calling thread and its future children.
 #[cfg(not(target_os = "macos"))]
-fn enter_python_sandbox(python_paths: &[PathBuf]) -> Result<(), String> {
+fn enter_python_sandbox(python_paths: &[PathBuf], allow_network: bool) -> Result<(), String> {
     let private_dir = std::env::current_dir()
         .and_then(std::fs::canonicalize)
         .map_err(|err| format!("cannot resolve worker directory: {err}"))?;
@@ -122,20 +136,36 @@ fn enter_python_sandbox(python_paths: &[PathBuf]) -> Result<(), String> {
     if let Some(paths) = std::env::var_os("LD_LIBRARY_PATH") {
         read_only.extend(std::env::split_paths(&paths));
     }
-    enter_impl(read_only, private_dir).map_err(|err| {
+    enter_impl(read_only, private_dir, allow_network).map_err(|err| {
         format!("Python UDF sandbox is unavailable, refusing to run user code: {err}")
     })
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn enter_impl(_read_only: Vec<PathBuf>, _private_dir: PathBuf) -> Result<(), String> {
+fn enter_impl(
+    _read_only: Vec<PathBuf>,
+    _private_dir: PathBuf,
+    _allow_network: bool,
+) -> Result<(), String> {
     Err("Python UDF workers can only be sandboxed on Linux (Landlock and seccomp)".into())
 }
 
 #[cfg(target_os = "linux")]
-fn enter_impl(mut read_only: Vec<PathBuf>, private_dir: PathBuf) -> Result<(), String> {
+fn enter_impl(
+    mut read_only: Vec<PathBuf>,
+    private_dir: PathBuf,
+    allow_network: bool,
+) -> Result<(), String> {
     wait_single_threaded()?;
     read_only.extend(SYSTEM_READ_PATHS.iter().map(PathBuf::from));
+    if allow_network {
+        read_only.extend(NETWORK_READ_PATHS.iter().map(PathBuf::from));
+        for key in ["SSL_CERT_FILE", "SSL_CERT_DIR"] {
+            if let Some(path) = std::env::var_os(key) {
+                read_only.push(PathBuf::from(path));
+            }
+        }
+    }
     // Resolves to /proc/<pid>: other processes' entries stay unreadable.
     read_only.push(PathBuf::from("/proc/self"));
 
@@ -144,7 +174,8 @@ fn enter_impl(mut read_only: Vec<PathBuf>, private_dir: PathBuf) -> Result<(), S
             "Landlock is not available (needs Linux 5.13+ with 'landlock' in the LSM list): {err}"
         )
     })?;
-    let ruleset = landlock::Ruleset::new(abi).map_err(|err| format!("Landlock: {err}"))?;
+    let ruleset =
+        landlock::Ruleset::new(abi, allow_network).map_err(|err| format!("Landlock: {err}"))?;
     for path in &read_only {
         // An operator-provided search path of "/" would expose everything.
         if path.as_os_str().is_empty() || is_root(path) {
@@ -168,7 +199,7 @@ fn enter_impl(mut read_only: Vec<PathBuf>, private_dir: PathBuf) -> Result<(), S
     ruleset
         .restrict_self()
         .map_err(|err| format!("Landlock: {err}"))?;
-    seccomp::install(abi).map_err(|err| format!("seccomp: {err}"))
+    seccomp::install(abi, allow_network).map_err(|err| format!("seccomp: {err}"))
 }
 
 /// Stopped threads (e.g. allocator background threads) are joined before
@@ -283,7 +314,7 @@ mod landlock {
     }
 
     impl Ruleset {
-        pub fn new(abi: u32) -> io::Result<Self> {
+        pub fn new(abi: u32, allow_network: bool) -> io::Result<Self> {
             let mut handled_fs = ABI_1_FS;
             for (min_abi, right) in [(2, REFER), (3, TRUNCATE), (5, IOCTL_DEV)] {
                 if abi >= min_abi {
@@ -292,9 +323,11 @@ mod landlock {
             }
             let attr = RulesetAttr {
                 handled_access_fs: handled_fs,
-                // No TCP rule is added: handling the rights denies them all.
+                // Keep TCP bind denied. Outbound TCP is handled (and denied)
+                // unless explicitly authorized by the host; UDP is covered by
+                // the seccomp socket-family policy on every supported ABI.
                 handled_access_net: if abi >= 4 {
-                    NET_BIND_TCP | NET_CONNECT_TCP
+                    NET_BIND_TCP | if allow_network { 0 } else { NET_CONNECT_TCP }
                 } else {
                     0
                 },
@@ -390,6 +423,7 @@ mod seccomp {
     #[cfg(target_arch = "x86_64")]
     const JGE_K: u16 = 0x35; // BPF_JMP | BPF_JGE | BPF_K
     const JSET_K: u16 = 0x45; // BPF_JMP | BPF_JSET | BPF_K
+    const AND_K: u16 = 0x54; // BPF_ALU | BPF_AND | BPF_K
     const RET_K: u16 = 0x06; // BPF_RET | BPF_K
 
     const RET_ALLOW: u32 = 0x7fff_0000;
@@ -401,6 +435,7 @@ mod seccomp {
     const DATA_NR: u32 = 0;
     const DATA_ARCH: u32 = 4;
     const DATA_ARG0_LOW: u32 = 16;
+    const DATA_ARG1_LOW: u32 = 24;
 
     #[cfg(target_arch = "x86_64")]
     const AUDIT_ARCH: u32 = 0xC000_003E;
@@ -501,6 +536,8 @@ mod seccomp {
 
     enum Rule {
         Errno(i32),
+        /// Outbound IPv4/IPv6 clients only; never local-service Unix sockets.
+        InternetSocket,
         /// kill(): only this process (0, pid) or its own group (-pid).
         Kill,
         /// tgkill()/rt_*sigqueueinfo(): only threads of this process.
@@ -529,6 +566,18 @@ mod seccomp {
     fn body(rule: &Rule, pid: i32) -> Vec<sock_filter> {
         match rule {
             Rule::Errno(value) => vec![errno(*value)],
+            Rule::InternetSocket => vec![
+                stmt(LD_W_ABS, DATA_ARG0_LOW),
+                jump(JEQ_K, libc::AF_INET as u32, 2, 0),
+                jump(JEQ_K, libc::AF_INET6 as u32, 1, 0),
+                errno(libc::EACCES),
+                stmt(LD_W_ABS, DATA_ARG1_LOW),
+                stmt(AND_K, !((libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK) as u32)),
+                jump(JEQ_K, libc::SOCK_STREAM as u32, 2, 0),
+                jump(JEQ_K, libc::SOCK_DGRAM as u32, 1, 0),
+                errno(libc::EACCES),
+                stmt(RET_K, RET_ALLOW),
+            ],
             Rule::Kill => vec![
                 stmt(LD_W_ABS, DATA_ARG0_LOW),
                 jump(JEQ_K, 0, 3, 0),
@@ -553,11 +602,21 @@ mod seccomp {
         }
     }
 
-    pub fn program(landlock_abi: u32, pid: i32) -> Vec<sock_filter> {
+    pub fn program(landlock_abi: u32, pid: i32, allow_network: bool) -> Vec<sock_filter> {
         let mut rules = vec![
-            // No sockets at all: no network and no Unix sockets of other
-            // services. The IPC connection exists before the filter.
-            (libc::SYS_socket, Rule::Errno(libc::EACCES)),
+            // The host authorizes network access, never the function's code.
+            // The private IPC connection exists before the filter.
+            (
+                libc::SYS_socket,
+                if allow_network {
+                    Rule::InternetSocket
+                } else {
+                    Rule::Errno(libc::EACCES)
+                },
+            ),
+            // This compatibility policy grants clients, not network servers.
+            (libc::SYS_bind, Rule::Errno(libc::EACCES)),
+            (libc::SYS_listen, Rule::Errno(libc::EACCES)),
             // clone3 flags live in memory BPF cannot read. ENOSYS makes libc
             // fall back to clone(), whose flags are checked.
             (libc::SYS_clone3, Rule::Errno(libc::ENOSYS)),
@@ -598,9 +657,9 @@ mod seccomp {
         filter
     }
 
-    pub fn install(landlock_abi: u32) -> io::Result<()> {
+    pub fn install(landlock_abi: u32, allow_network: bool) -> io::Result<()> {
         // SAFETY: getpid has no preconditions.
-        let filter = program(landlock_abi, unsafe { libc::getpid() });
+        let filter = program(landlock_abi, unsafe { libc::getpid() }, allow_network);
         let prog = libc::sock_fprog {
             len: filter.len() as u16,
             filter: filter.as_ptr() as *mut sock_filter,
@@ -630,7 +689,7 @@ mod seccomp {
     not(any(target_arch = "x86_64", target_arch = "aarch64"))
 ))]
 mod seccomp {
-    pub fn install(_landlock_abi: u32) -> std::io::Result<()> {
+    pub fn install(_landlock_abi: u32, _allow_network: bool) -> std::io::Result<()> {
         Err(std::io::Error::other("unsupported architecture"))
     }
 }
@@ -655,10 +714,21 @@ mod tests {
 
     /// Minimal classic-BPF interpreter for the instructions the filter uses.
     fn run(filter: &[libc::sock_filter], arch: u32, nr: c_long, arg0: u64) -> u32 {
+        run_with_arg1(filter, arch, nr, arg0, libc::SOCK_STREAM as u64)
+    }
+
+    fn run_with_arg1(
+        filter: &[libc::sock_filter],
+        arch: u32,
+        nr: c_long,
+        arg0: u64,
+        arg1: u64,
+    ) -> u32 {
         let mut data = [0u8; 64];
         data[0..4].copy_from_slice(&(nr as u32).to_le_bytes());
         data[4..8].copy_from_slice(&arch.to_le_bytes());
         data[16..24].copy_from_slice(&arg0.to_le_bytes());
+        data[24..32].copy_from_slice(&arg1.to_le_bytes());
         let (mut pc, mut acc) = (0usize, 0u32);
         loop {
             let insn = filter[pc];
@@ -672,6 +742,7 @@ mod tests {
                 0x15 => pc += if acc == insn.k { jt } else { jf },
                 0x35 => pc += if acc >= insn.k { jt } else { jf },
                 0x45 => pc += if acc & insn.k != 0 { jt } else { jf },
+                0x54 => acc &= insn.k,
                 0x06 => return insn.k,
                 code => panic!("unexpected BPF opcode {code:#x}"),
             }
@@ -685,8 +756,55 @@ mod tests {
     const ARCH: u32 = 0xC000_00B7;
 
     #[test]
+    fn test_network_policy_keeps_other_restrictions() {
+        for abi in [1, 3, 4, 7] {
+            for allow_network in [false, true] {
+                let filter = program(abi, PID, allow_network);
+                let check = |nr, arg0| run(&filter, ARCH, nr, arg0);
+                for family in [libc::AF_INET, libc::AF_INET6] {
+                    assert_eq!(
+                        check(libc::SYS_socket, family as u64),
+                        if allow_network {
+                            ALLOW
+                        } else {
+                            errno(libc::EACCES)
+                        }
+                    );
+                }
+                for kind in [libc::SOCK_STREAM, libc::SOCK_DGRAM, libc::SOCK_RAW] {
+                    for flags in [0, libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK] {
+                        assert_eq!(
+                            run_with_arg1(
+                                &filter,
+                                ARCH,
+                                libc::SYS_socket,
+                                libc::AF_INET as u64,
+                                (kind | flags) as u64
+                            ),
+                            if allow_network && kind != libc::SOCK_RAW {
+                                ALLOW
+                            } else {
+                                errno(libc::EACCES)
+                            }
+                        );
+                    }
+                }
+                for family in [libc::AF_UNIX, libc::AF_NETLINK, libc::AF_PACKET] {
+                    assert_eq!(check(libc::SYS_socket, family as u64), errno(libc::EACCES));
+                }
+                for nr in [libc::SYS_bind, libc::SYS_listen] {
+                    assert_eq!(check(nr, 0), errno(libc::EACCES));
+                }
+                for nr in [libc::SYS_execve, libc::SYS_ptrace, libc::SYS_io_uring_setup] {
+                    assert_eq!(check(nr, 0), errno(libc::EPERM));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_seccomp_program() {
-        let filter = program(7, PID);
+        let filter = program(7, PID, false);
         assert!(filter.len() < 4096);
         let check = |nr, arg0| run(&filter, ARCH, nr, arg0);
 
@@ -709,7 +827,7 @@ mod tests {
         assert_eq!(check(libc::SYS_openat, 0), ALLOW);
         assert_eq!(check(libc::SYS_truncate, 0), ALLOW);
         assert_eq!(
-            run(&program(2, PID), ARCH, libc::SYS_truncate, 0),
+            run(&program(2, PID, false), ARCH, libc::SYS_truncate, 0),
             errno(libc::EPERM)
         );
 

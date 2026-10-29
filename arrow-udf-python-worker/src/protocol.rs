@@ -15,7 +15,7 @@
 //! Wire protocol between a host and its workers.
 //!
 //! Host → worker: frames of `u32` big-endian length + bytes. The first frame is
-//! the JSON [`WorkerFunction`]; every later frame is one request.
+//! the JSON [`WorkerInit`]; every later frame is one request.
 //! Worker → host: `u8` status (0 = ok, 1 = error) + `u32` length + bytes, one
 //! response per frame. An error response carries a UTF-8 message; the worker
 //! exits after sending it.
@@ -32,6 +32,16 @@ use serde::{Deserialize, Serialize};
 /// Upper bound of a frame, checked before allocating, including for
 /// malformed peer output.
 pub const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
+
+/// Host-controlled startup policy, independent of the UDF definition. Flattening
+/// preserves the original function fields; an omitted policy denies networking.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct WorkerInit<T> {
+    #[serde(flatten)]
+    pub function: T,
+    #[serde(default)]
+    pub allow_network: bool,
+}
 
 /// The function a worker serves for its whole life.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -196,6 +206,30 @@ mod tests {
         // Finish without its part, and a part longer than the frame.
         assert!(decode_aggregate_request(&[3]).is_err());
         assert!(decode_aggregate_request(&[3, 0, 0, 0, 9, 1]).is_err());
+    }
+
+    #[test]
+    fn test_worker_init_network_policy_defaults_to_denied() {
+        let function = WorkerFunction {
+            name: "test".into(),
+            handler: "handler".into(),
+            code: "def handler(x): return x".into(),
+            return_field: Field::new("result", arrow_schema::DataType::Int64, true),
+            aggregate_state: None,
+            prelude: None,
+        };
+        let old = serde_json::to_vec(&function).unwrap();
+        let init: WorkerInit<WorkerFunction> = serde_json::from_slice(&old).unwrap();
+        assert!(!init.allow_network);
+        assert_eq!(init.function, function);
+        let bytes = serde_json::to_vec(&WorkerInit {
+            function: &function,
+            allow_network: true,
+        })
+        .unwrap();
+        let init: WorkerInit<WorkerFunction> = serde_json::from_slice(&bytes).unwrap();
+        assert!(init.allow_network);
+        assert_eq!(init.function, function);
     }
 
     #[test]
