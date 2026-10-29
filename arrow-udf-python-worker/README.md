@@ -78,6 +78,51 @@ loopback and internal destinations become reachable, subject to deployment egres
 policy. Do not expose this policy as user-controlled function metadata. It is
 fixed at worker startup and cannot be changed by Python code.
 
+### Host-policy HTTP(S) transport
+
+`WorkerCommand::network_proxy` accepts an `Arc<dyn NetworkProxy>` implemented by
+the host. This is a separate, fail-closed mode: it is mutually exclusive with
+`allow_network = true` and requires the enforced Linux OS sandbox. It is the
+transport primitive for hosts that manage endpoint permissions, for example via
+Databend `NETWORK RULE` / `EXTERNAL ACCESS INTEGRATION`; it does **not** implement
+those SQL policies or make a whitelist decision itself.
+
+Before entering the sandbox, the worker connects a private Unix control stream.
+A Python socket adapter sends local stream endpoints over that channel to the
+host proxy and selects it through `http_proxy` / `https_proxy`. Proxy-aware
+clients such as `urllib.request` and `requests` can then issue HTTP or HTTPS
+CONNECT requests without an Internet socket in the worker. Native/direct
+IPv4/IPv6 sockets remain denied by seccomp; restoring Python's original socket
+class, ignoring proxy environment variables, or using native libraries does not
+restore direct network access. Arbitrary TCP/UDP clients, async socket clients,
+and libraries that require native Internet sockets are not supported.
+
+The host MUST implement an HTTP proxy with trusted authorization context (not
+context supplied by Python). It must validate every HTTP target and CONNECT
+host/port, apply rule changes to new requests/connections, resolve targets on the
+host, and impose parse/connect/idle/resource limits. It must not trust a client
+Host header as the sole authority or allow a denied redirect target. Existing
+CONNECT tunnels are opaque: hosts must explicitly define and enforce their
+revocation boundary (e.g. close tunnels on policy revocation or bound their
+lifetime). The transport does not inspect TLS requests inside a tunnel and does
+not promise instantaneous revocation of an existing connection.
+
+Each worker has at most 32 active host proxy tasks, with bounded control-channel
+backpressure. Dropping the worker cancels the control task and its proxy tasks;
+failed/cancelled worker requests still require dropping the worker as usual.
+Resolver/public certificate paths are readable for client TLS support, while
+all filesystem/process sandbox restrictions remain in effect. macOS remains
+unconfined development-only for the legacy modes and refuses this mode rather
+than claiming proxy-only network enforcement.
+
+`cargo test -p arrow-udf-python-worker` covers local HTTP, verified HTTPS,
+redirect denial, policy updates on an existing worker, concurrent streams and
+kernel-level direct socket denial, without external services/packages. To also
+exercise `requests`, install it into your Python environment (or a private
+`PYTHONPATH`) and run
+`ARROW_UDF_TEST_REQUESTS=1 cargo test -p arrow-udf-python-worker --test network_proxy`.
+The flag does not install packages, and import failures fail the test.
+
 Requirements: Linux 5.13+ with Landlock enabled, x86_64 or aarch64, and a
 container seccomp profile that permits the `landlock_*` syscalls. The worker
 must be single-threaded when it enters the sandbox; use
