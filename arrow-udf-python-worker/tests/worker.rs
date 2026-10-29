@@ -334,7 +334,7 @@ def handler(x):
 
 #[cfg(target_os = "linux")]
 async fn network_policy_tests() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
     assert!(!command().allow_network);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -347,7 +347,7 @@ import socket, ssl, urllib.request
 
 def handler(x):
     ssl.create_default_context()
-    with urllib.request.urlopen('http://localhost:{port}/', timeout=2) as response:
+    with urllib.request.urlopen('http://localhost:{port}/snapshot', timeout=2) as response:
         assert response.read() == b'ok'
     try:
         socket.socket(socket.AF_UNIX)
@@ -377,13 +377,28 @@ def handler(x):
     drop(denied);
 
     let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut request = [0; 4096];
-        assert!(stream.read(&mut request).await.unwrap() > 0);
-        stream
-            .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok")
-            .await
-            .unwrap();
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = tokio::io::BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).await.unwrap();
+            // Local service probes must not consume the UDF's one response.
+            if !line.starts_with("GET /snapshot ") {
+                continue;
+            }
+            loop {
+                line.clear();
+                if stream.read_line(&mut line).await.unwrap() == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            stream
+                .get_mut()
+                .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+            break;
+        }
     });
     let mut command = command();
     command.allow_network = true;
