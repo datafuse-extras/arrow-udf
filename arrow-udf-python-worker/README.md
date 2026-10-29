@@ -44,7 +44,8 @@ host was killed.
 ## Protocol
 
 Frames are a `u32` big-endian length followed by the payload. The first frame is
-the JSON `WorkerFunction`; responses are a status byte, a length and the payload
+the JSON `WorkerFunction` fields plus the host-controlled `allow_network` policy
+(default `false` when absent); responses are a status byte, a length and the payload
 (an error message on failure, after which the worker exits).
 
 - Scalar functions: a request and its response are single Arrow IPC streams.
@@ -63,10 +64,19 @@ runs user code.
 - Landlock: read-only access to the Python installation (`sys.path`, stdlib,
   site-packages), system libraries and a few device/proc entries; read-write
   access only below the working directory.
-- seccomp: no sockets, no `execve`, no new processes (`fork`, `vfork`, `clone`
+- seccomp: no sockets by default, no `execve`, no new processes (`fork`, `vfork`, `clone`
   without `CLONE_THREAD`), no signals outside the worker, no ptrace, io_uring,
   bpf, namespaces, mounts or kernel modules, no path-based permission changes,
   no x32 syscalls.
+
+A host may explicitly set `WorkerCommand::allow_network = true` for a temporary
+compatibility exception. This permits outbound IPv4/IPv6 stream and datagram
+sockets, plus read-only resolver and public CA data. TCP bind/connect policy is
+adjusted without removing filesystem confinement; `bind`/`listen`, Unix sockets,
+raw sockets and process creation stay denied. This is not a destination allowlist:
+loopback and internal destinations become reachable, subject to deployment egress
+policy. Do not expose this policy as user-controlled function metadata. It is
+fixed at worker startup and cannot be changed by Python code.
 
 Requirements: Linux 5.13+ with Landlock enabled, x86_64 or aarch64, and a
 container seccomp profile that permits the `landlock_*` syscalls. The worker

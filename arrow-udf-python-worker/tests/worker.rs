@@ -332,6 +332,106 @@ def handler(x):
     );
 }
 
+#[cfg(target_os = "linux")]
+async fn network_policy_tests() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    assert!(!command().allow_network);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let function = scalar(
+        "network",
+        &format!(
+            r#"
+import pathlib, socket, ssl, urllib.request
+
+def handler(x):
+    context = ssl.create_default_context()
+    with urllib.request.urlopen('http://localhost:{port}/snapshot', timeout=2) as response:
+        assert response.read() == b'ok'
+    # OpenSSL capath symlinks may resolve outside /etc/ssl/certs. Verify the
+    # public source CA stores remain readable on distributions that use them.
+    for directory in ['/usr/share/ca-certificates', '/usr/local/share/ca-certificates']:
+        for certificate in pathlib.Path(directory).rglob('*.crt'):
+            context.load_verify_locations(cafile=str(certificate))
+            assert context.cert_store_stats()['x509_ca'] > 0
+            break
+    try:
+        socket.socket(socket.AF_UNIX)
+    except PermissionError:
+        return x
+    raise AssertionError('Unix sockets must stay denied')
+"#
+        ),
+    );
+    // Numeric address keeps DNS failure from masking the socket permission error.
+    let denied_function = scalar(
+        "network_denied",
+        &function.code.replace("localhost", "127.0.0.1"),
+    );
+    let (mut denied, _dir) = spawn(&denied_function).await.unwrap();
+    let response = denied
+        .request(&encode_batch(&int64_batch(vec![7])).unwrap())
+        .await
+        .unwrap();
+    let batch = decode_batch(&response).unwrap();
+    let errors = batch.column_by_name("error").unwrap().as_string::<i32>();
+    assert!(
+        errors.value(0).contains("Permission denied"),
+        "{}",
+        errors.value(0)
+    );
+    drop(denied);
+
+    let server = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = tokio::io::BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).await.unwrap();
+            // Local service probes must not consume the UDF's one response.
+            if !line.starts_with("GET /snapshot ") {
+                continue;
+            }
+            loop {
+                line.clear();
+                if stream.read_line(&mut line).await.unwrap() == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            stream
+                .get_mut()
+                .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+            break;
+        }
+    });
+    let mut command = command();
+    command.allow_network = true;
+    let dir = tempfile::tempdir().unwrap();
+    let mut worker = WorkerProcess::spawn(
+        &command,
+        &function,
+        dir.path(),
+        Box::new(()),
+        tokio::runtime::Handle::current(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            call(&mut worker, vec![7])
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        [7]
+    );
+    server.await.unwrap();
+}
+
 fn main() {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
     if args.first().is_some_and(|arg| arg == WORKER_ARG) {
@@ -358,6 +458,8 @@ fn main() {
         aggregate_tests().await;
         #[cfg(target_os = "linux")]
         sandbox_tests().await;
+        #[cfg(target_os = "linux")]
+        network_policy_tests().await;
         println!("python worker tests passed (sandbox enforced: {SANDBOX_ENFORCED})");
     });
 }

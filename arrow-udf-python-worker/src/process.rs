@@ -24,7 +24,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 
-use crate::protocol::{check_length, WorkerFunction};
+use crate::protocol::{check_length, WorkerFunction, WorkerInit};
 
 /// Variables any Python process needs to locate itself and its locale.
 pub const PYTHON_ENV: &[&str] = &[
@@ -72,6 +72,9 @@ pub fn allowed_env(names: &[&str], prefixes: &[&str]) -> Vec<(OsString, OsString
 pub struct WorkerCommand {
     pub program: PathBuf,
     pub args: Vec<OsString>,
+    /// Host-authorized outbound IPv4/IPv6 access. Defaults to false; filesystem,
+    /// Unix-socket and process restrictions remain enforced when enabled.
+    pub allow_network: bool,
 }
 
 impl WorkerCommand {
@@ -81,6 +84,7 @@ impl WorkerCommand {
         Ok(Self {
             program: std::env::current_exe()?,
             args: args.into_iter().map(Into::into).collect(),
+            allow_network: false,
         })
     }
 }
@@ -175,7 +179,12 @@ impl WorkerProcess {
             },
             _ipc_dir: ipc_dir,
         };
-        worker.write_frame(&serde_json::to_vec(function)?).await?;
+        worker
+            .write_frame(&serde_json::to_vec(&WorkerInit {
+                function,
+                allow_network: command.allow_network,
+            })?)
+            .await?;
         worker.read_response().await?;
         Ok(worker)
     }
