@@ -119,24 +119,9 @@ fn receive_stream(control: &UnixStream) -> io::Result<Option<UnixStream>> {
     if received < 0 {
         return Err(io::Error::last_os_error());
     }
-    let mut descriptors = Vec::new();
-    // SAFETY: ancillary headers and descriptor numbers were validated/written by
-    // recvmsg. Every delivered fd is immediately owned, even on malformed input.
-    unsafe {
-        let mut header = libc::CMSG_FIRSTHDR(&message);
-        while !header.is_null() {
-            if (*header).cmsg_level == libc::SOL_SOCKET && (*header).cmsg_type == libc::SCM_RIGHTS {
-                let bytes = (*header).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
-                for index in 0..bytes / size_of::<libc::c_int>() {
-                    let fd = std::ptr::read_unaligned(
-                        libc::CMSG_DATA(header).cast::<libc::c_int>().add(index),
-                    );
-                    descriptors.push(OwnedFd::from_raw_fd(fd));
-                }
-            }
-            header = libc::CMSG_NXTHDR(&message, header);
-        }
-    }
+    // SAFETY: recvmsg succeeded, so the control buffer holds descriptors that
+    // were just installed for this process and are owned by nothing else.
+    let mut descriptors = unsafe { take_descriptors(&message) };
     if received == 0 && descriptors.is_empty() {
         return Ok(None);
     }
@@ -201,6 +186,42 @@ fn receive_stream(control: &UnixStream) -> io::Result<Option<UnixStream>> {
     let stream = std::os::unix::net::UnixStream::from(descriptor);
     stream.set_nonblocking(true)?;
     UnixStream::from_std(stream).map(Some)
+}
+
+/// Own every SCM_RIGHTS descriptor that recvmsg wrote into `message`.
+///
+/// On truncation (MSG_CTRUNC), Linux shortens `cmsg_len` to the descriptors it
+/// delivered, but macOS can leave the original length. Bound each header by the
+/// `msg_controllen` that recvmsg returned, or bytes past the written buffer are
+/// taken as descriptors and closing them closes unrelated files.
+///
+/// # Safety
+/// `message` must describe a control buffer filled by a successful recvmsg
+/// whose descriptors are not owned by anything else.
+unsafe fn take_descriptors(message: &libc::msghdr) -> Vec<OwnedFd> {
+    // msg_controllen is usize on Linux but socklen_t (u32) on macOS.
+    #[allow(clippy::unnecessary_cast)]
+    let end = (message.msg_control as usize).saturating_add(message.msg_controllen as usize);
+    let mut descriptors = Vec::new();
+    let mut header = libc::CMSG_FIRSTHDR(message);
+    while !header.is_null() {
+        let length = (*header).cmsg_len as usize;
+        if length < libc::CMSG_LEN(0) as usize {
+            // Malformed: a header shorter than itself cannot be advanced past.
+            break;
+        }
+        let claimed = length - libc::CMSG_LEN(0) as usize;
+        if (*header).cmsg_level == libc::SOL_SOCKET && (*header).cmsg_type == libc::SCM_RIGHTS {
+            let data = libc::CMSG_DATA(header);
+            let written = end.saturating_sub(data as usize);
+            for index in 0..claimed.min(written) / size_of::<libc::c_int>() {
+                let fd = std::ptr::read_unaligned(data.cast::<libc::c_int>().add(index));
+                descriptors.push(OwnedFd::from_raw_fd(fd));
+            }
+        }
+        header = libc::CMSG_NXTHDR(message, header);
+    }
+    descriptors
 }
 
 pub(crate) fn prelude(
@@ -293,5 +314,57 @@ mod tests {
         assert_ne!(flags & libc::FD_CLOEXEC, 0);
         drop(sender);
         assert!(receive_stream(&receiver).unwrap().is_none());
+    }
+
+    // Simulates the macOS MSG_CTRUNC result: cmsg_len still claims a full
+    // buffer, but recvmsg wrote only two descriptors. Bytes past msg_controllen
+    // must never be adopted (and later closed) as owned descriptors.
+    #[test]
+    fn truncated_control_message_takes_only_written_descriptors() {
+        use std::os::fd::IntoRawFd;
+
+        let (first, second) = std::os::unix::net::UnixStream::pair().unwrap();
+        let unrelated = tempfile::tempfile().unwrap();
+        let mut ancillary = [0usize; 16];
+        // SAFETY: CMSG_LEN only computes a length.
+        let header_len = unsafe { libc::CMSG_LEN(0) } as usize;
+        let capacity = (size_of_val(&ancillary) - header_len) / size_of::<libc::c_int>();
+        // SAFETY: zeroed msghdr has null pointers and lengths until set below.
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_control = ancillary.as_mut_ptr().cast();
+        message.msg_controllen = size_of_val(&ancillary) as _;
+        let delivered = [first.into_raw_fd(), second.into_raw_fd()];
+        // SAFETY: the header and its claimed data lie within `ancillary`.
+        unsafe {
+            let header = libc::CMSG_FIRSTHDR(&message);
+            (*header).cmsg_level = libc::SOL_SOCKET;
+            (*header).cmsg_type = libc::SCM_RIGHTS;
+            (*header).cmsg_len = libc::CMSG_LEN((capacity * size_of::<libc::c_int>()) as _) as _;
+            let data = libc::CMSG_DATA(header).cast::<libc::c_int>();
+            for index in 0..capacity {
+                let fd = delivered
+                    .get(index)
+                    .copied()
+                    .unwrap_or(unrelated.as_raw_fd());
+                data.add(index).write_unaligned(fd);
+            }
+        }
+        message.msg_controllen = (header_len + size_of_val(&delivered)) as _;
+        // SAFETY: `delivered` ownership was released above; `unrelated` lies
+        // past msg_controllen and must stay owned by the test.
+        let descriptors = unsafe { take_descriptors(&message) };
+        assert_eq!(
+            descriptors
+                .iter()
+                .map(AsRawFd::as_raw_fd)
+                .collect::<Vec<_>>(),
+            delivered
+        );
+        drop(descriptors);
+        // SAFETY: F_GETFD on a descriptor number has no pointer arguments.
+        assert_ne!(
+            unsafe { libc::fcntl(unrelated.as_raw_fd(), libc::F_GETFD) },
+            -1
+        );
     }
 }
