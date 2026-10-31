@@ -41,6 +41,8 @@ pub(crate) struct WorkerInit<T> {
     pub function: T,
     #[serde(default)]
     pub allow_network: bool,
+    #[serde(default)]
+    pub network_proxy_socket: Option<std::path::PathBuf>,
 }
 
 /// The function a worker serves for its whole life.
@@ -221,10 +223,12 @@ mod tests {
         let old = serde_json::to_vec(&function).unwrap();
         let init: WorkerInit<WorkerFunction> = serde_json::from_slice(&old).unwrap();
         assert!(!init.allow_network);
+        assert!(init.network_proxy_socket.is_none());
         assert_eq!(init.function, function);
         let bytes = serde_json::to_vec(&WorkerInit {
             function: &function,
             allow_network: true,
+            network_proxy_socket: None,
         })
         .unwrap();
         let init: WorkerInit<WorkerFunction> = serde_json::from_slice(&bytes).unwrap();

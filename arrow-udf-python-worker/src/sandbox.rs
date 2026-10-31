@@ -42,13 +42,13 @@ pub const SANDBOX_ENFORCED: bool = !cfg!(target_os = "macos");
 /// Confine the calling worker before it runs user code. Must run while the
 /// process is single-threaded.
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn enter(allow_network: bool) -> Result<(), String> {
-    enter_python_sandbox(&python_read_paths()?, allow_network)
+pub(crate) fn enter(allow_network: bool, network_proxy: bool) -> Result<(), String> {
+    enter_python_sandbox(&python_read_paths()?, allow_network, network_proxy)
 }
 
 /// Local development only: no Landlock/seccomp on macOS.
 #[cfg(target_os = "macos")]
-pub(crate) fn enter(_allow_network: bool) -> Result<(), String> {
+pub(crate) fn enter(_allow_network: bool, _network_proxy: bool) -> Result<(), String> {
     Ok(())
 }
 
@@ -130,7 +130,11 @@ paths = sorted(paths)
 /// Confine the calling process. Must run while it is single-threaded: a
 /// Landlock domain only covers the calling thread and its future children.
 #[cfg(not(target_os = "macos"))]
-fn enter_python_sandbox(python_paths: &[PathBuf], allow_network: bool) -> Result<(), String> {
+fn enter_python_sandbox(
+    python_paths: &[PathBuf],
+    allow_network: bool,
+    network_proxy: bool,
+) -> Result<(), String> {
     let private_dir = std::env::current_dir()
         .and_then(std::fs::canonicalize)
         .map_err(|err| format!("cannot resolve worker directory: {err}"))?;
@@ -141,9 +145,13 @@ fn enter_python_sandbox(python_paths: &[PathBuf], allow_network: bool) -> Result
     if let Some(paths) = std::env::var_os("LD_LIBRARY_PATH") {
         read_only.extend(std::env::split_paths(&paths));
     }
-    enter_impl(read_only, private_dir, allow_network).map_err(|err| {
-        format!("Python UDF sandbox is unavailable, refusing to run user code: {err}")
-    })
+    enter_impl(
+        read_only,
+        private_dir,
+        allow_network,
+        allow_network || network_proxy,
+    )
+    .map_err(|err| format!("Python UDF sandbox is unavailable, refusing to run user code: {err}"))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -151,6 +159,7 @@ fn enter_impl(
     _read_only: Vec<PathBuf>,
     _private_dir: PathBuf,
     _allow_network: bool,
+    _network_data: bool,
 ) -> Result<(), String> {
     Err("Python UDF workers can only be sandboxed on Linux (Landlock and seccomp)".into())
 }
@@ -160,10 +169,11 @@ fn enter_impl(
     mut read_only: Vec<PathBuf>,
     private_dir: PathBuf,
     allow_network: bool,
+    network_data: bool,
 ) -> Result<(), String> {
     wait_single_threaded()?;
     read_only.extend(SYSTEM_READ_PATHS.iter().map(PathBuf::from));
-    if allow_network {
+    if network_data {
         read_only.extend(NETWORK_READ_PATHS.iter().map(PathBuf::from));
         if let Some(path) = std::env::var_os("SSL_CERT_FILE") {
             read_only.push(PathBuf::from(path));

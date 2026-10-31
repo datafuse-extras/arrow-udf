@@ -24,6 +24,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 
+use crate::network_proxy::{NetworkProxy, ProxyTask};
 use crate::protocol::{check_length, WorkerFunction, WorkerInit};
 
 /// Variables any Python process needs to locate itself and its locale.
@@ -75,6 +76,9 @@ pub struct WorkerCommand {
     /// Host-authorized outbound IPv4/IPv6 access. Defaults to false; filesystem,
     /// Unix-socket and process restrictions remain enforced when enabled.
     pub allow_network: bool,
+    /// Host-authorized HTTP(S) proxy. Mutually exclusive with direct networking;
+    /// every worker network socket stays denied. The host owns target policy.
+    pub network_proxy: Option<std::sync::Arc<dyn NetworkProxy>>,
 }
 
 impl WorkerCommand {
@@ -85,6 +89,7 @@ impl WorkerCommand {
             program: std::env::current_exe()?,
             args: args.into_iter().map(Into::into).collect(),
             allow_network: false,
+            network_proxy: None,
         })
     }
 }
@@ -103,6 +108,7 @@ impl WorkerCommand {
 pub struct WorkerProcess {
     socket: UnixStream,
     reaper: Reaper,
+    _network_proxy: Option<ProxyTask>,
     _ipc_dir: tempfile::TempDir,
 }
 
@@ -124,6 +130,16 @@ impl WorkerProcess {
         keep_alive: Box<dyn Any + Send>,
         reaper: tokio::runtime::Handle,
     ) -> Result<Self> {
+        if command.network_proxy.is_some() {
+            anyhow::ensure!(
+                !command.allow_network,
+                "host proxy and direct networking are mutually exclusive"
+            );
+            anyhow::ensure!(
+                crate::SANDBOX_ENFORCED,
+                "host-proxy networking requires the Linux OS sandbox"
+            );
+        }
         let ipc_dir = tempfile::Builder::new()
             .prefix("arrow-udf-worker-")
             .tempdir()?;
@@ -135,6 +151,15 @@ impl WorkerProcess {
         // is arbitrary.
         let socket_path = ipc_dir.path().join("ipc");
         let listener = tokio::net::UnixListener::bind(&socket_path)?;
+        let proxy_path = ipc_dir.path().join("proxy");
+        let proxy = command
+            .network_proxy
+            .as_ref()
+            .map(|proxy| {
+                let listener = tokio::net::UnixListener::bind(&proxy_path)?;
+                Ok::<_, std::io::Error>((listener, proxy.clone()))
+            })
+            .transpose()?;
         let mut process = Command::new(&command.program);
         process
             .args(&command.args)
@@ -177,12 +202,15 @@ impl WorkerProcess {
                 keep_alive: startup.keep_alive.take(),
                 reaper: startup.reaper.clone(),
             },
+            _network_proxy: proxy
+                .map(|(listener, proxy)| ProxyTask::start(listener, proxy, &startup.reaper)),
             _ipc_dir: ipc_dir,
         };
         worker
             .write_frame(&serde_json::to_vec(&WorkerInit {
                 function,
                 allow_network: command.allow_network,
+                network_proxy_socket: command.network_proxy.as_ref().map(|_| proxy_path),
             })?)
             .await?;
         worker.read_response().await?;

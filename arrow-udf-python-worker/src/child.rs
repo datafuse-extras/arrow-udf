@@ -51,9 +51,26 @@ pub fn run_worker(socket_path: &Path, hooks: WorkerHooks) -> Result<()> {
     let init = (|| {
         let init: WorkerInit<WorkerFunction> = serde_json::from_slice(&read_frame(&mut socket)?)?;
         let function = init.function;
+        anyhow::ensure!(
+            !(init.allow_network && init.network_proxy_socket.is_some()),
+            "host proxy and direct networking are mutually exclusive"
+        );
+        let proxy = init
+            .network_proxy_socket
+            .as_ref()
+            .map(UnixStream::connect)
+            .transpose()
+            .context("connect to host proxy")?;
         let mut builder = arrow_udf_runtime::python::Builder::default();
-        if let Some(prelude) = &function.prelude {
-            builder = builder.safe_codes(prelude.clone());
+        let prelude = match &proxy {
+            Some(control) => Some(crate::network_proxy::prelude(
+                control,
+                function.prelude.as_deref(),
+            )?),
+            None => function.prelude.clone(),
+        };
+        if let Some(prelude) = prelude {
+            builder = builder.safe_codes(prelude);
         }
         let mut runtime = builder.build()?;
         // The interpreter is initialized but no user code has run. Confine the
@@ -62,7 +79,7 @@ pub fn run_worker(socket_path: &Path, hooks: WorkerHooks) -> Result<()> {
         if let Some(before_sandbox) = hooks.before_sandbox {
             before_sandbox()?;
         }
-        sandbox::enter(init.allow_network).map_err(anyhow::Error::msg)?;
+        sandbox::enter(init.allow_network, proxy.is_some()).map_err(anyhow::Error::msg)?;
         watch_parent(&socket)?;
         let aggregate = function.aggregate_state.is_some();
         match function.aggregate_state {
@@ -81,9 +98,9 @@ pub fn run_worker(socket_path: &Path, hooks: WorkerHooks) -> Result<()> {
                 &function.handler,
             ),
         }?;
-        Ok((runtime, function.name, aggregate))
+        Ok((runtime, function.name, aggregate, proxy))
     })();
-    let (runtime, name, aggregate) = match init {
+    let (runtime, name, aggregate, _proxy) = match init {
         Ok(value) => {
             respond(&mut socket, Ok(Vec::new()))?;
             value

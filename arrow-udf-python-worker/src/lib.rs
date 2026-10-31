@@ -31,12 +31,14 @@
 #![cfg(unix)]
 
 mod child;
+mod network_proxy;
 mod process;
 mod protocol;
 mod sandbox;
 
 pub use child::run_worker;
 pub use child::WorkerHooks;
+pub use network_proxy::NetworkProxy;
 pub use process::allowed_env;
 pub use process::WorkerCommand;
 pub use process::WorkerProcess;
